@@ -6,6 +6,7 @@ import difflib
 import ctypes
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 import yt_dlp
@@ -15,14 +16,20 @@ from mutagen.mp3 import MP3
 # --- CONFIGURATION & STYLING ---
 ctk.set_appearance_mode("Dark")
 ACCENT_COLOR = "#FF3131"
-BG_COLOR = "#0D0D0D"
-CARD_COLOR = "#1A1A1A"
+BG_COLOR = "#141414"
+CARD_COLOR = "#1F1F1F"
+SURFACE_COLOR = "#252525"
+INPUT_COLOR = "#2A2A2A"
+BORDER_COLOR = "#343434"
+TEXT_MUTED = "#A6A6A6"
 DELETE_BTN_COLOR = "#2B2B2B"
 DELETE_BTN_HOVER = ACCENT_COLOR
 PLAY_SYMBOL = "▶"
 PAUSE_SYMBOL = "⏸"
 SEARCH_DELAY_MS = 350
 MIN_SEARCH_LENGTH = 3
+MAX_SIMULTANEOUS_DOWNLOADS = 3
+SECTION_LINE_COLOR = "#FF4A4A"
 TOOLTIP_TEXT = (
     "Supported Modes -\n"
     "1.) Single song (mention artist name for accurate results)\n"
@@ -73,6 +80,10 @@ class GTAMusicManager(ctk.CTk):
         self.pending_refresh_job = None
         self.library_cache = {}
         self.library_index = {}
+        self.download_lock = threading.Lock()
+        self.download_total = 0
+        self.download_completed = 0
+        self.download_failed = 0
         self.sort_mode = ctk.StringVar(value="Date Added")
         self.sort_direction = ctk.StringVar(value=self.config.get("sort_direction", "Descending"))
         self.tooltip_window = None
@@ -278,78 +289,98 @@ class GTAMusicManager(ctk.CTk):
 
     def setup_ui(self):
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(4, weight=1)
+        self.grid_rowconfigure(3, weight=1)
 
         # --- HEADER ---
         self.header_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.header_frame.grid(row=0, column=0, padx=30, pady=(30, 10), sticky="w")
+        self.header_frame.grid(row=0, column=0, padx=24, pady=(20, 6), sticky="ew")
+        self.header_frame.grid_columnconfigure(0, weight=1)
         
-        self.header_label = ctk.CTkLabel(self.header_frame, text="GTAV", font=("Impact", 42), text_color=ACCENT_COLOR)
-        self.header_label.pack(side="left")
-        self.sub_header = ctk.CTkLabel(self.header_frame, text=" USER MUSIC MANAGER", font=("Segoe UI Semibold", 18), text_color="white")
-        self.sub_header.pack(side="left", padx=10, pady=(15, 0))
+        self.header_label = ctk.CTkLabel(self.header_frame, text="GTA V User Music Manager", font=("Segoe UI Semibold", 25), text_color="white")
+        self.header_label.grid(row=0, column=0, sticky="w")
+        self.sub_header = ctk.CTkLabel(self.header_frame, text="Download, organize, preview, and manage your soundtrack library.", font=("Segoe UI", 12), text_color=TEXT_MUTED)
+        self.sub_header.grid(row=1, column=0, pady=(4, 0), sticky="w")
 
-        # --- PATH CONFIG ---
-        self.path_frame = ctk.CTkFrame(self, fg_color=CARD_COLOR, corner_radius=15, height=60)
-        self.path_frame.grid(row=1, column=0, padx=30, pady=10, sticky="ew")
-        self.path_frame.grid_columnconfigure(0, weight=1)
+        # --- COMPACT WORKSPACE ---
+        self.workspace_card = ctk.CTkFrame(self, fg_color=CARD_COLOR, corner_radius=12, border_width=1, border_color=BORDER_COLOR)
+        self.workspace_card.grid(row=1, column=0, padx=24, pady=(6, 8), sticky="ew")
+        self.workspace_card.grid_columnconfigure(0, weight=1)
+        self.create_section_header(self.workspace_card, "Library Tools").grid(row=0, column=0, padx=18, pady=(14, 6), sticky="w")
+
+        self.path_row = ctk.CTkFrame(self.workspace_card, fg_color="transparent")
+        self.path_row.grid(row=1, column=0, padx=18, pady=(6, 8), sticky="ew")
+        self.path_row.grid_columnconfigure(1, weight=1)
+
+        self.path_label = ctk.CTkLabel(self.path_row, text="Folder", font=("Segoe UI Semibold", 12), text_color="white", width=54)
+        self.path_label.grid(row=0, column=0, padx=(0, 12), sticky="w")
 
         self.path_entry = ctk.CTkEntry(
-            self.path_frame, 
-            height=45, 
-            fg_color="#000000", 
-            border_color="#333", 
+            self.path_row,
+            height=40,
+            fg_color=INPUT_COLOR,
+            border_color=BORDER_COLOR,
+            corner_radius=6,
+            border_width=1,
             font=("Segoe UI", 12)
         )
-        self.path_entry.grid(row=0, column=0, padx=15, pady=10, sticky="ew")
+        self.path_entry.grid(row=0, column=1, padx=(0, 12), sticky="ew")
         self.register_entry_placeholder(self.path_entry, self.default_path_placeholder)
         if self.current_target_path != self.default_gta_path:
             self.set_entry_text(self.path_entry, self.current_target_path)
 
         self.browse_btn = ctk.CTkButton(
-            self.path_frame, text="CHANGE FOLDER", fg_color="#222", hover_color=ACCENT_COLOR, 
-            width=140, height=45, font=("Segoe UI Bold", 12), command=self.browse_path
+            self.path_row, text="Browse...", fg_color=SURFACE_COLOR, hover_color="#343434",
+            border_width=1, border_color=ACCENT_COLOR, text_color="white",
+            width=110, height=40, corner_radius=8, font=("Segoe UI Semibold", 12), command=self.browse_path
         )
-        self.browse_btn.grid(row=0, column=1, padx=(0, 15), pady=10)
+        self.browse_btn.grid(row=0, column=2)
 
-        # --- DOWNLOAD ENGINE ---
-        self.dl_card = ctk.CTkFrame(self, fg_color=CARD_COLOR, corner_radius=15)
-        self.dl_card.grid(row=2, column=0, padx=30, pady=10, sticky="ew")
-        self.dl_card.grid_columnconfigure(1, weight=1)
+        self.sync_row = ctk.CTkFrame(self.workspace_card, fg_color="transparent")
+        self.sync_row.grid(row=2, column=0, padx=18, pady=(0, 14), sticky="ew")
+        self.sync_row.grid_columnconfigure(1, weight=1)
+
+        self.sync_label = ctk.CTkLabel(self.sync_row, text="Sync", font=("Segoe UI Semibold", 12), text_color="white", width=54)
+        self.sync_label.grid(row=0, column=0, padx=(0, 12), sticky="w")
+
+        self.sync_input_row = ctk.CTkFrame(self.sync_row, fg_color="transparent")
+        self.sync_input_row.grid(row=0, column=1, padx=(0, 12), sticky="ew")
+        self.sync_input_row.grid_columnconfigure(1, weight=1)
 
         self.info_btn = ctk.CTkButton(
-            self.dl_card,
+            self.sync_input_row,
             text="i",
-            width=36,
-            height=36,
-            corner_radius=18,
-            fg_color="#202020",
+            width=34,
+            height=34,
+            corner_radius=10,
+            fg_color=SURFACE_COLOR,
             hover_color=ACCENT_COLOR,
-            font=("Segoe UI Bold", 16)
+            border_width=1,
+            border_color=ACCENT_COLOR,
+            font=("Segoe UI Bold", 15)
         )
-        self.info_btn.grid(row=0, column=0, padx=(20, 10), pady=20)
+        self.info_btn.grid(row=0, column=0, padx=(0, 10), sticky="w")
         self.info_btn.bind("<Enter>", self.show_download_tooltip)
         self.info_btn.bind("<Leave>", self.schedule_tooltip_hide)
 
         self.url_input = ctk.CTkEntry(
-            self.dl_card,
-            height=50, fg_color="#000", border_color=ACCENT_COLOR, font=("Segoe UI", 14)
+            self.sync_input_row,
+            height=40, fg_color=INPUT_COLOR, border_color=BORDER_COLOR, border_width=1, corner_radius=6, font=("Segoe UI", 12)
         )
-        self.url_input.grid(row=0, column=1, padx=(0, 20), pady=20, sticky="ew")
+        self.url_input.grid(row=0, column=1, sticky="ew")
         self.register_entry_placeholder(self.url_input, "Search Songs, Paste URL's, Check \"i button\" for more info")
 
         self.sync_btn = ctk.CTkButton(
-            self.dl_card, text="SYNC LIBRARY", fg_color=ACCENT_COLOR, hover_color="#D32F2F", 
-            height=50, width=180, font=("Segoe UI Black", 14), command=self.start_download_thread
+            self.sync_row, text="SYNC LIBRARY", fg_color=ACCENT_COLOR, hover_color="#D32F2F",
+            height=40, width=156, corner_radius=8, font=("Segoe UI Bold", 12), command=self.start_download_thread
         )
-        self.sync_btn.grid(row=0, column=2, padx=(0, 20), pady=20)
+        self.sync_btn.grid(row=0, column=2)
 
         # --- STATUS & SEARCH ---
         self.info_row = ctk.CTkFrame(self, fg_color="transparent")
-        self.info_row.grid(row=3, column=0, padx=35, pady=(10, 0), sticky="ew")
+        self.info_row.grid(row=2, column=0, padx=24, pady=(4, 0), sticky="ew")
         self.info_row.grid_columnconfigure(0, weight=1)
 
-        self.status_label = ctk.CTkLabel(self.info_row, text="● SYSTEM READY", font=("Segoe UI Bold", 11), text_color="#00FF41")
+        self.status_label = ctk.CTkLabel(self.info_row, text="● SYSTEM READY", font=("Segoe UI Semibold", 11), text_color="#00FF41")
         self.status_label.grid(row=0, column=0, sticky="w")
 
         self.controls_row = ctk.CTkFrame(self.info_row, fg_color="transparent")
@@ -360,12 +391,12 @@ class GTAMusicManager(ctk.CTk):
             values=["Date Added", "Alphabetical", "Length"],
             variable=self.sort_mode,
             width=145,
-            height=30,
-            fg_color="#242424",
-            button_color="#303030",
+            height=34,
+            fg_color=SURFACE_COLOR,
+            button_color=INPUT_COLOR,
             button_hover_color=ACCENT_COLOR,
-            dropdown_fg_color="#181818",
-            dropdown_hover_color="#2C2C2C",
+            dropdown_fg_color=CARD_COLOR,
+            dropdown_hover_color=SURFACE_COLOR,
             command=lambda _choice: self.schedule_refresh(0)
         )
         self.sort_menu.pack(side="left", padx=(0, 10))
@@ -375,24 +406,40 @@ class GTAMusicManager(ctk.CTk):
             values=["Descending", "Ascending"],
             variable=self.sort_direction,
             width=120,
-            height=30,
-            fg_color="#242424",
-            button_color="#303030",
+            height=34,
+            fg_color=SURFACE_COLOR,
+            button_color=INPUT_COLOR,
             button_hover_color=ACCENT_COLOR,
-            dropdown_fg_color="#181818",
-            dropdown_hover_color="#2C2C2C",
+            dropdown_fg_color=CARD_COLOR,
+            dropdown_hover_color=SURFACE_COLOR,
             command=self.on_sort_direction_change
         )
         self.sort_direction_menu.pack(side="left", padx=(0, 10))
 
-        self.search_bar = ctk.CTkEntry(self.controls_row, width=220, height=30, fg_color="#1a1a1a", border_width=1)
+        self.search_bar = ctk.CTkEntry(self.controls_row, width=240, height=34, fg_color=INPUT_COLOR, border_color=BORDER_COLOR, border_width=1, corner_radius=6)
         self.search_bar.pack(side="left")
         self.register_entry_placeholder(self.search_bar, "Filter library...")
         self.search_bar.bind("<KeyRelease>", self.on_library_search_keyrelease, add="+")
 
         # --- LIBRARY ---
-        self.scroll_container = ctk.CTkScrollableFrame(self, fg_color="transparent", label_text="STORED TRACKS", label_font=("Segoe UI Bold", 12))
-        self.scroll_container.grid(row=4, column=0, padx=30, pady=(10, 30), sticky="nsew")
+        self.scroll_container = ctk.CTkScrollableFrame(
+            self,
+            fg_color=CARD_COLOR,
+            border_width=1,
+            border_color=BORDER_COLOR,
+            corner_radius=12,
+            label_text="STORED TRACKS",
+            label_font=("Segoe UI Semibold", 14)
+        )
+        self.scroll_container.grid(row=3, column=0, padx=24, pady=(8, 24), sticky="nsew")
+
+    def create_section_header(self, parent, text):
+        frame = ctk.CTkFrame(parent, fg_color="transparent")
+        label = ctk.CTkLabel(frame, text=text, font=("Segoe UI Semibold", 16), text_color="white")
+        label.pack(anchor="w")
+        line = ctk.CTkFrame(frame, fg_color=SECTION_LINE_COLOR, height=2, width=max(56, len(text) * 7), corner_radius=1)
+        line.pack(anchor="w", pady=(6, 0))
+        return frame
 
     def register_entry_placeholder(self, entry, placeholder_text):
         self.placeholder_state[entry] = {"text": placeholder_text, "active": False}
@@ -466,7 +513,7 @@ class GTAMusicManager(ctk.CTk):
         x = self.info_btn.winfo_rootx() + 18
         y = self.info_btn.winfo_rooty() + self.info_btn.winfo_height() + 10
         self.tooltip_window.geometry(f"+{x}+{y}")
-        tooltip_frame = ctk.CTkFrame(self.tooltip_window, fg_color="#141414", border_width=1, border_color="#3A3A3A", corner_radius=10)
+        tooltip_frame = ctk.CTkFrame(self.tooltip_window, fg_color=CARD_COLOR, border_width=1, border_color=BORDER_COLOR, corner_radius=10)
         tooltip_frame.pack(fill="both", expand=True)
         tooltip_label = ctk.CTkLabel(
             tooltip_frame,
@@ -476,7 +523,7 @@ class GTAMusicManager(ctk.CTk):
             padx=14,
             pady=12,
             font=("Segoe UI", 12),
-            text_color="#E5E5E5"
+            text_color="white"
         )
         tooltip_label.pack(fill="both", expand=True)
         for widget in (self.tooltip_window, tooltip_frame, tooltip_label):
@@ -625,30 +672,30 @@ class GTAMusicManager(ctk.CTk):
         return False
 
     def create_song_item(self, fname):
-        item = ctk.CTkFrame(self.scroll_container, fg_color="#121212", corner_radius=10)
-        item.pack(fill="x", pady=4, padx=5)
+        item = ctk.CTkFrame(self.scroll_container, fg_color=SURFACE_COLOR, corner_radius=10, border_width=1, border_color=BORDER_COLOR)
+        item.pack(fill="x", pady=5, padx=10)
         top_row = ctk.CTkFrame(item, fg_color="transparent")
-        top_row.pack(fill="x", padx=15, pady=10)
-        play_btn = ctk.CTkButton(top_row, text=PLAY_SYMBOL, width=35, height=35, fg_color="#222", hover_color=ACCENT_COLOR, command=lambda: self.toggle_song(fname))
+        top_row.pack(fill="x", padx=14, pady=10)
+        play_btn = ctk.CTkButton(top_row, text=PLAY_SYMBOL, width=36, height=36, corner_radius=8, fg_color=INPUT_COLOR, hover_color=ACCENT_COLOR, command=lambda: self.toggle_song(fname))
         play_btn.pack(side="left")
-        name_lbl = ctk.CTkLabel(top_row, text=fname, font=("Segoe UI", 13), anchor="w")
-        name_lbl.pack(side="left", padx=15, fill="x", expand=True)
+        name_lbl = ctk.CTkLabel(top_row, text=fname, font=("Segoe UI", 13), text_color="white", anchor="w")
+        name_lbl.pack(side="left", padx=14, fill="x", expand=True)
         del_btn = ctk.CTkButton(
             top_row,
             text="✕",
             width=32,
             height=32,
             corner_radius=8,
-            fg_color=DELETE_BTN_COLOR,
+            fg_color=INPUT_COLOR,
             text_color="#BEBEBE",
             hover_color=DELETE_BTN_HOVER,
             border_width=1,
-            border_color="#3F3F3F",
+            border_color=BORDER_COLOR,
             font=("Segoe UI Bold", 12),
             command=lambda: self.delete_file(fname)
         )
         del_btn.pack(side="right")
-        player_row = ctk.CTkFrame(item, fg_color="#0a0a0a", height=0)
+        player_row = ctk.CTkFrame(item, fg_color=CARD_COLOR, height=0, corner_radius=8)
         self.active_widgets[fname] = {"frame": player_row, "play_btn": play_btn, "slider": None, "time_lbl": None, "vol_slider": None, "is_loaded": False}
 
         if fname == self.playing_filename:
@@ -661,15 +708,15 @@ class GTAMusicManager(ctk.CTk):
 
         ui["frame"].pack(fill="x")
         inner = ctk.CTkFrame(ui["frame"], fg_color="transparent")
-        inner.pack(fill="x", padx=15, pady=10)
+        inner.pack(fill="x", padx=14, pady=10)
         ui["slider"] = ctk.CTkSlider(inner, from_=0, to=max(self.song_duration, 1), height=15, button_color=ACCENT_COLOR, progress_color=ACCENT_COLOR)
         ui["slider"].pack(side="left", fill="x", expand=True, padx=(0, 10))
         ui["slider"].set(0)
         ui["slider"].bind("<ButtonPress-1>", lambda _event: setattr(self, 'is_seeking', True))
         ui["slider"].bind("<ButtonRelease-1>", lambda _event: self.seek_song(ui["slider"].get()))
-        ui["time_lbl"] = ctk.CTkLabel(inner, text="0:00 / 0:00", font=("Consolas", 11), text_color="gray", width=80)
+        ui["time_lbl"] = ctk.CTkLabel(inner, text="0:00 / 0:00", font=("Consolas", 11), text_color=TEXT_MUTED, width=88)
         ui["time_lbl"].pack(side="left", padx=(0, 10))
-        vol_lbl = ctk.CTkLabel(inner, text="Vol", font=("Segoe UI Bold", 10), text_color="#555")
+        vol_lbl = ctk.CTkLabel(inner, text="Vol", font=("Segoe UI Semibold", 10), text_color=TEXT_MUTED)
         vol_lbl.pack(side="left", padx=(5, 5))
         ui["vol_slider"] = ctk.CTkSlider(inner, from_=0, to=1, height=15, width=80, button_color=ACCENT_COLOR, progress_color=ACCENT_COLOR, command=self.set_volume)
         ui["vol_slider"].pack(side="left")
@@ -1012,8 +1059,7 @@ class GTAMusicManager(ctk.CTk):
         return score
 
     def pick_best_search_entry(self, query, entries):
-        ranked = sorted(entries or [], key=lambda entry: self.score_search_result(query, entry), reverse=True)
-        return ranked[0] if ranked else None
+        return max(entries or [], key=lambda entry: self.score_search_result(query, entry), default=None)
 
     def is_url(self, text):
         lowered = (text or "").lower()
@@ -1052,24 +1098,149 @@ class GTAMusicManager(ctk.CTk):
         if os.path.exists(orig_mp3) and os.path.abspath(orig_mp3) != os.path.abspath(final_path):
             final_path = self.make_unique_output_path(final_path)
             os.rename(orig_mp3, final_path)
+        return final_path
+
+    def update_status(self, text, text_color="#00FF41"):
+        self.after(0, lambda: self.status_label.configure(text=text, text_color=text_color))
+
+    def build_status_prefix(self, index):
+        with self.download_lock:
+            return f"● [{index}/{self.download_total}]"
+
+    def mark_download_progress(self, success):
+        with self.download_lock:
+            if success:
+                self.download_completed += 1
+            else:
+                self.download_failed += 1
+            completed = self.download_completed
+            failed = self.download_failed
+            total = self.download_total
+        return completed, failed, total
+
+    def make_download_hook(self, query, index):
+        prefix = self.build_status_prefix(index)
+
+        def hook(data):
+            if data.get('status') == 'downloading':
+                percent = data.get('_percent_str', '0%').strip()
+                speed = data.get('_speed_str', 'N/A').strip()
+                self.update_status(f"{prefix} DOWNLOADING: {query} ({percent}, {speed})", ACCENT_COLOR)
+            elif data.get('status') == 'finished':
+                self.update_status(f"{prefix} PROCESSING: {query}", "#FFCC00")
+
+        return hook
+
+    def build_download_options(self, path, local_ffmpeg, progress_hook):
+        return {
+            'format': 'bestaudio/best',
+            'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '192'}],
+            'outtmpl': os.path.join(path, '%(title)s.%(ext)s'),
+            'progress_hooks': [progress_hook],
+            'match_filter': yt_dlp.utils.match_filter_func("!is_live & duration < 660"),
+            'ffmpeg_location': local_ffmpeg,
+            'quiet': True,
+            'no_warnings': True
+        }
+
+    def build_search_options(self, local_ffmpeg):
+        return {
+            'ffmpeg_location': local_ffmpeg,
+            'quiet': True,
+            'no_warnings': True,
+            'skip_download': True,
+            'extract_flat': True
+        }
+
+    def is_search_result_downloadable(self, entry):
+        if not entry:
+            return False
+        entry_type = (entry.get('_type') or '').lower()
+        if entry_type in {'playlist', 'multi_video', 'channel', 'show'}:
+            return False
+        url = (entry.get('webpage_url') or entry.get('url') or '').lower()
+        if 'list=' in url and 'watch?' not in url:
+            return False
+        return True
+
+    def get_entry_target_url(self, entry):
+        webpage_url = entry.get('webpage_url')
+        if webpage_url:
+            return webpage_url
+        url = entry.get('url') or ''
+        if url.startswith('http://') or url.startswith('https://'):
+            return url
+        if entry.get('ie_key') == 'Youtube' and entry.get('id'):
+            return f"https://www.youtube.com/watch?v={entry['id']}"
+        return url
+
+    def download_single_query(self, query, index, path, local_ffmpeg):
+        prefix = self.build_status_prefix(index)
+        self.update_status(f"{prefix} SEARCHING: {query}", "#3399ff")
+
+        search_entry = None
+        query_label = query
+        if self.is_url(query):
+            with yt_dlp.YoutubeDL(self.build_search_options(local_ffmpeg)) as ydl:
+                info = ydl.extract_info(query, download=False)
+            if self.is_playlist_url(query):
+                entries = [entry for entry in (info.get('entries') or []) if entry]
+                if not entries:
+                    raise ValueError(f"No downloadable tracks found in playlist '{query}'.")
+                playlist_name = info.get('title') or query
+                self.update_status(f"{prefix} FOUND: Playlist - {playlist_name} ({len(entries)} tracks)", "#8BD450")
+                with yt_dlp.YoutubeDL(self.build_download_options(path, local_ffmpeg, self.make_download_hook(playlist_name, index))) as ydl:
+                    info = ydl.extract_info(query, download=True)
+                    entries = [entry for entry in (info.get('entries') or []) if entry]
+                    completed_files = []
+                    for playlist_entry in entries:
+                        final_path = self.rename_downloaded_entry(path, ydl, playlist_entry, playlist_entry.get('title', ''))
+                        completed_files.append(final_path)
+                        self.after(0, self.refresh_file_list)
+                    return completed_files
+            search_entry = info.get('entries', [info])[0]
+            query_label = search_entry.get('title') or query
+        else:
+            with yt_dlp.YoutubeDL(self.build_search_options(local_ffmpeg)) as ydl:
+                search_info = ydl.extract_info(f"ytsearch3:{query}", download=False)
+            candidates = [entry for entry in (search_info.get('entries') or []) if self.is_search_result_downloadable(entry)]
+            search_entry = self.pick_best_search_entry(query, candidates)
+            if not search_entry:
+                raise ValueError(f"No strong song match found for '{query}'.")
+            query_label = search_entry.get('title') or query
+
+        self.update_status(f"{prefix} FOUND: {query_label}", "#8BD450")
+        target_url = self.get_entry_target_url(search_entry)
+        with yt_dlp.YoutubeDL(self.build_download_options(path, local_ffmpeg, self.make_download_hook(query_label, index))) as ydl:
+            info = ydl.extract_info(target_url, download=True)
+            entry = info.get('entries', [info])[0]
+            final_path = self.rename_downloaded_entry(path, ydl, entry, query)
+
+        self.update_status(f"{prefix} COMPLETED: {os.path.basename(final_path)}", "#00FF41")
+        self.after(0, self.refresh_file_list)
+        return [final_path]
 
     def start_download_thread(self):
         txt = self.get_entry_text(self.url_input)
         if not txt:
             return
         self.save_config(target_path=self.get_active_path()) # Save path on sync
-        queries = txt.split(',')
+        queries = [query.strip() for query in txt.split(',') if query.strip()]
+        if not queries:
+            return
+        self.download_total = len(queries)
+        self.download_completed = 0
+        self.download_failed = 0
         self.sync_btn.configure(state="disabled", text="SYNCING...")
         threading.Thread(target=self.run_download_logic, args=(queries,), daemon=True).start()
 
-    def dl_hook(self, d):
-        if d['status'] == 'downloading':
-            p = d.get('_percent_str', '0%')
-            s = d.get('_speed_str', 'N/A')
-            self.after(0, lambda: self.status_label.configure(text=f"● DOWNLOADING: {p} ({s})", text_color=ACCENT_COLOR))
-
     def run_download_logic(self, queries):
         path = self.get_active_path()
+        if not path:
+            self.after(0, lambda: messagebox.showerror("Missing Folder", "Set your GTA User Music folder before syncing."))
+            self.after(0, self.finish_download)
+            return
+        os.makedirs(path, exist_ok=True)
         # Look for ffmpeg in app folder
         local_ffmpeg = next(
             (
@@ -1079,43 +1250,23 @@ class GTAMusicManager(ctk.CTk):
             ),
             None
         )
-        
-        opts = {
-            'format': 'bestaudio/best',
-            'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '192'}],
-            'outtmpl': os.path.join(path, '%(title)s.%(ext)s'),
-            'progress_hooks': [self.dl_hook],
-            'match_filter': yt_dlp.utils.match_filter_func("!is_live & duration < 660"),
-            'ffmpeg_location': local_ffmpeg,
-            'quiet': True, 'no_warnings': True
-        }
 
-        for q in queries:
-            q = q.strip()
-            if not q: continue
-            self.after(0, lambda q=q: self.status_label.configure(text=f"● SEARCHING: {q}", text_color="#3399ff"))
-            try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    if self.is_url(q):
-                        info = ydl.extract_info(q, download=True)
-                        if self.is_playlist_url(q):
-                            entries = [entry for entry in (info.get('entries') or []) if entry]
-                            if not entries:
-                                raise ValueError(f"No downloadable tracks found in playlist '{q}'.")
-                            for playlist_entry in entries:
-                                self.rename_downloaded_entry(path, ydl, playlist_entry, playlist_entry.get('title', ''))
-                            continue
-                        entry = info.get('entries', [info])[0]
-                    else:
-                        search_info = ydl.extract_info(f"ytsearch8:{q}", download=False)
-                        entry = self.pick_best_search_entry(q, search_info.get('entries', []))
-                        if not entry:
-                            raise ValueError(f"No strong song match found for '{q}'.")
-                        target_url = entry.get('webpage_url') or entry.get('url')
-                        info = ydl.extract_info(target_url, download=True)
-                        entry = info.get('entries', [info])[0]
-                    self.rename_downloaded_entry(path, ydl, entry, q)
-            except Exception as e: self.after(0, lambda e=e: messagebox.showerror("Download Error", str(e)))
+        max_workers = min(MAX_SIMULTANEOUS_DOWNLOADS, len(queries))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(self.download_single_query, query, index, path, local_ffmpeg): (index, query)
+                for index, query in enumerate(queries, start=1)
+            }
+            for future in as_completed(futures):
+                index, query = futures[future]
+                try:
+                    future.result()
+                    completed, failed, total = self.mark_download_progress(success=True)
+                    self.update_status(f"● COMPLETED {completed}/{total} | FAILED {failed}: {query}", "#00FF41")
+                except Exception as e:
+                    completed, failed, total = self.mark_download_progress(success=False)
+                    self.update_status(f"● FAILED {failed}/{total}: {query}", ACCENT_COLOR)
+                    self.after(0, lambda e=e: messagebox.showerror("Download Error", str(e)))
         self.after(0, self.finish_download)
 
     def finish_download(self):
